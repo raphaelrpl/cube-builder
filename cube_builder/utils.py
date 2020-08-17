@@ -810,7 +810,58 @@ def publish_datacube(cube, bands, datacube, tile_id, period, scenes, cloudratio,
 
         ql_files = []
         for band in bands:
+            scene_band = scenes.get(band)
+
+            if scene_band is None:
+                logging.warning(f'Expected Band {band} for quicklook not generated. Skipping')
+                continue
+
             ql_files.append(scenes[band][composite_function])
+
+        if len(ql_files) != 3:
+            logging.warning('Skipping quicklook generation')
+
+            with db.session.begin_nested():
+                defaults = dict(id=item_id,
+                    collection_id=item_datacube,
+                    grs_schema_id=cube.grs_schema_id,
+                    tile_id=tile_id,
+                    item_date=start_date,
+                    composite_start=start_date,
+                    composite_end=end_date,
+                    cloud_cover=cloudratio,
+                    scene_type=composite_function,
+                    compressed_file=None)
+
+                _item, _ = get_or_create_model(CollectionItem, defaults=defaults, id=item_id)
+
+                for band in scenes:
+                    band_model = list(filter(lambda b: b.name == band, cube_bands))
+
+                    # Band does not exists on model
+                    if not band_model:
+                        logging.warning('Band {} of {} does not exist on database. Skipping'.format(band, cube.id))
+                        continue
+
+                    asset_relative_path = scenes[band][composite_function].replace(Config.DATA_DIR, '')
+
+                    asset_defaults = dict(collection_id=item_datacube,
+                        band_id=band_model[0].id,
+                        grs_schema_id=cube.grs_schema_id,
+                        tile_id=tile_id,
+                        collection_item_id=item_id,
+                        url='{}'.format(asset_relative_path),
+                        source=None,
+                        raster_size_x=raster_size_schemas.raster_size_x,
+                        raster_size_y=raster_size_schemas.raster_size_y,
+                        raster_size_t=1,
+                        chunk_size_x=raster_size_schemas.chunk_size_x,
+                        chunk_size_y=raster_size_schemas.chunk_size_y,
+                        chunk_size_t=1)
+                    asset, _ = get_or_create_model(Asset, defaults=asset_defaults, collection_item_id=item_id, collection_id=item_datacube, band_id=band_model[0].id)
+                    asset.url = str(asset_relative_path)
+            db.session.commit()
+            continue
 
         quick_look_file = generate_quick_look(str(quick_look_file), ql_files)
 
@@ -896,7 +947,61 @@ def publish_merge(bands, datacube, tile_id, period, date, scenes, band_map):
 
     ql_files = []
     for band in bands:
+        scene_band = scenes['ARDfiles'].get(band)
+
+        if scene_band is None:
+            logging.warning(f'Expected Band {band} for quicklook not generated. Skipping')
+            continue
+
         ql_files.append(scenes['ARDfiles'][band])
+
+    if len(ql_files) != 3:
+        logging.warning('Skipping quicklook generation')
+
+        with db.session.begin_nested():
+            defaults = dict(id=item_id,
+                collection_id=datacube.id,
+                grs_schema_id=datacube.grs_schema_id,
+                tile_id=tile_id,
+                item_date=date,
+                composite_start=date,
+                composite_end=period.split('_')[-1],
+                cloud_cover=scenes.get('cloudratio', 0),
+                scene_type='WARPED',
+                compressed_file=None)
+
+            _item, _ = get_or_create_model(CollectionItem, defaults=defaults, id=item_id, collection_id=datacube.id)
+
+            for band in scenes['ARDfiles']:
+                band_model = list(filter(lambda b: b.name == band, cube_bands))
+
+                # Band does not exists on model
+                if not band_model:
+                    logging.warning('Band {} of {} does not exist on database'.format(band, datacube.id))
+                    continue
+
+                asset_relative_path = scenes['ARDfiles'][band].replace(Config.DATA_DIR, '')
+
+                asset_default = dict(
+                    collection_id=datacube.id,
+                    band_id=band_model[0].id,
+                    grs_schema_id=datacube.grs_schema_id,
+                    tile_id=tile_id,
+                    collection_item_id=item_id,
+                    url='{}'.format(asset_relative_path),
+                    source=None,
+                    raster_size_x=raster_size_schemas.raster_size_x,
+                    raster_size_y=raster_size_schemas.raster_size_y,
+                    raster_size_t=1,
+                    chunk_size_x=raster_size_schemas.chunk_size_x,
+                    chunk_size_y=raster_size_schemas.chunk_size_y,
+                    chunk_size_t=1
+                )
+                asset, _ = get_or_create_model(Asset, defaults=asset_default, collection_id=datacube.id, collection_item_id=item_id, band_id=band_model[0].id)
+
+        db.session.commit()
+        return
+
 
     quick_look_file = generate_quick_look(str(quick_look_file), ql_files)
 

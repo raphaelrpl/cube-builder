@@ -264,6 +264,8 @@ def publish(blends, band_map, **kwargs):
     Args:
         activity - Datacube Activity Model
     """
+    if isinstance(blends, dict):
+        blends = [blends]
     period = blends[0]['period']
     logging.info(f'Executing publish {period}')
 
