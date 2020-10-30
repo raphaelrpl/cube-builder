@@ -231,6 +231,7 @@ def prepare_blend(merges, band_map: dict, **kwargs):
         activity['tile_id'] = _merge['tile_id']
         activity['nodata'] = _merge['args'].get('nodata')
         activity['version'] = version
+        activity['activity_type'] = 'blend'
         # TODO: Check instance type for backward compatibility
         activity['datasets'] = _merge['args']['datasets']
 
