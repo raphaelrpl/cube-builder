@@ -16,6 +16,7 @@ from . import create_app
 
 
 # Create cube-builder cli from bdc-db
+from .utils.interpreter import execute_expression
 from .utils.package import package_info
 
 
@@ -105,6 +106,9 @@ def worker(ctx: click.Context):
 @click.option('--with-rgb', is_flag=True, help='Generate a file with RGB bands, based in quick look.')
 @click.option('--token', type=click.STRING, help='Token to access data from STAC.')
 @click.option('--shape', type=click.STRING, help='Use custom output shape. i.e `--shape=10980x10980`')
+@click.option('--band-map', type=click.STRING, help='Use custom band map')
+@click.option('--expression', type=click.STRING, help='Use custom string expression to execute for each merge scene',
+              multiple=True)
 @with_appcontext
 def build(datacube: str, collections: str, tiles: str, start: str, end: str, bands: str = None,
           stac_url: str = None, force=False, with_rgb=False, shape=None, **kwargs):
@@ -138,6 +142,13 @@ def build(datacube: str, collections: str, tiles: str, start: str, end: str, ban
 
     if bands:
         data['bands'] = bands.split(',')
+
+    if kwargs.get('band_map'):
+        res = execute_expression(f'_res = {kwargs["band_map"]}', context=dict())
+        data['band_map'] = res['_res']
+
+    if kwargs.get('expression'):
+        data['expressions'] = data.pop('expression')
 
     if shape is not None:
         shape = shape.split('x')

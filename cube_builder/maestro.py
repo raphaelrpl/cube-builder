@@ -9,7 +9,6 @@
 """Define Cube Builder forms used to validate both data input and data serialization."""
 
 # Python
-import datetime
 from contextlib import contextmanager
 from time import time
 from typing import List
@@ -75,6 +74,7 @@ class Maestro:
     tiles = []
     mosaics = dict()
     cached_stacs = dict()
+    band_map: dict
 
     def __init__(self, datacube: str, collections: List[str], tiles: List[str], start_date: str, end_date: str, **properties):
         """Build Maestro interface."""
@@ -90,6 +90,10 @@ class Maestro:
 
         if bands:
             self.params['bands'] = bands
+
+        band_map = properties.pop('band_map', dict())
+
+        self.band_map = band_map
 
         force = properties.get('force', False)
         self.properties = properties
@@ -184,6 +188,25 @@ class Maestro:
 
             # Extra filter to only use bands of Input data cube.
             self.bands = [b for b in self.bands if b.name in collection_bands]
+
+        # Apply band_mapping
+        if self.band_map:
+            new_band_map = dict()
+
+            keys = set(list(self.band_map.keys()) + [b.name for b in self.bands])
+
+            for index, dataset in enumerate(self.params['collections']):
+                new_band_map[dataset] = {k: k for k in keys}
+
+                if index == 0:
+                    continue
+
+                for band_ref, bands_order in self.band_map.items():
+                    for band in bands_order:
+                        new_band_map.setdefault(dataset, dict())
+                        new_band_map[dataset][band_ref] = band
+                        break
+            self.band_map = new_band_map
 
         for tile in self.tiles:
             tile_name = tile.name
@@ -381,7 +404,7 @@ class Maestro:
                                 **properties
                             )
 
-                            task = warp_merge.s(activity, band_map, **self.properties)
+                            task = warp_merge.s(activity, band_map, processing_map=self.band_map, **self.properties)
                             merges_tasks.append(task)
 
                     if len(merges_tasks) > 0:
@@ -448,22 +471,29 @@ class Maestro:
 
                         for band in bands:
                             band_name_href = band.name
-                            if 'CBERS' in dataset and band.common_name not in ('evi', 'ndvi'):
-                                band_name_href = band.common_name
 
+                            if self.band_map:
+                                band_name_href = self.band_map[dataset][band.name]
+
+                                if band_name_href not in feature['assets']:
+                                    continue
+
+                            elif 'CBERS' in dataset and band.common_name not in ('evi', 'ndvi'):
+                                band_name_href = band.common_name
                             elif band.name not in feature['assets']:
                                 if f'sr_{band.name}' not in feature['assets']:
                                     continue
                                 else:
                                     band_name_href = f'sr_{band.name}'
 
+                            # checar map
                             scenes[band.name].setdefault(date, dict())
 
                             link = feature['assets'][band_name_href]['href']
 
                             scene = dict(**collection_bands[band.name])
                             scene['sceneid'] = identifier
-                            scene['band'] = band.name
+                            scene['band'] = band_name_href
                             scene['dataset'] = dataset
 
                             link = link.replace('cdsr.dpi.inpe.br/api/download/TIFF', 'www.dpi.inpe.br/catalog/tmp')

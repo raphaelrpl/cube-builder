@@ -33,11 +33,12 @@ from rasterio import Affine, MemoryFile
 from rasterio.warp import Resampling, reproject
 
 # Builder
+from rasterio.windows import get_data_window
 from rio_cogeo.cogeo import cog_translate
 from rio_cogeo.profiles import cog_profiles
 
+from .interpreter import execute_expression
 from ..config import Config
-
 
 # Constant to define required bands to generate both NDVI and EVI
 from ..constants import CLEAR_OBSERVATION_ATTRIBUTES, PROVENANCE_NAME, TOTAL_OBSERVATION_NAME, CLEAR_OBSERVATION_NAME, \
@@ -153,9 +154,7 @@ class DataCubeFragments(list):
         if len(self) < 4:
             return 'IDT'
 
-        return self[-1
-
-        ]
+        return self[-1]
 
 
 def get_cube_parts(datacube: str) -> DataCubeFragments:
@@ -216,7 +215,10 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
     dist_y = kwargs.get('dist_y')
     datasets = kwargs.get('datasets')
     resx, resy = kwargs['resx'], kwargs['resy']
-    
+
+    processing_map = kwargs.get('processing_map', None)
+    expressions = kwargs.get('expressions', None)
+
     shape = kwargs.get('shape', None)
     if shape:
         cols = shape[0]
@@ -225,7 +227,7 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
     else:
         cols = round(dist_x / resx)
         rows = round(dist_y / resy)
-        
+
         new_res_x = dist_x / cols
         new_res_y = dist_y / rows
 
@@ -271,6 +273,8 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
     template = None
     is_combined_collection = len(datasets) > 1
 
+    blocks = None
+
     with rasterio_access_token(kwargs.get('token')) as options:
         with rasterio.Env(CPL_CURL_VERBOSE=False, **get_rasterio_config(), **options):
             for asset in assets:
@@ -305,61 +309,101 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
                         'nodata': source_nodata
                     })
 
-                    with MemoryFile() as mem_file:
-                        with mem_file.open(**meta) as dst:
-                            if shape:
-                                raster = src.read(1)
-                            else:
-                                reproject(
-                                    source=rasterio.band(src, 1),
-                                    destination=raster,
-                                    src_transform=src.transform,
-                                    src_crs=src.crs,
-                                    dst_transform=transform,
-                                    dst_crs=srs,
-                                    src_nodata=source_nodata,
-                                    dst_nodata=nodata,
-                                    resampling=resampling)
+                    input_raster = src.read(1, masked=True)
 
-                            if band != band_map['quality'] or is_sentinel_landsat_quality_fmask:
-                                # For combined collections, we must merge only valid data into final data set
-                                if is_combined_collection:
-                                    positions_todo = numpy.where(raster_merge == nodata)
+                    # When giving custom map with Python string expressions, use it before re-project
+                    if processing_map and expressions:
+                        statement = None
 
-                                    if positions_todo:
-                                        valid_positions = numpy.where(raster != nodata)
+                        asset_band = asset['band']
 
-                                        raster_todo = numpy.ravel_multi_index(positions_todo, raster.shape)
-                                        raster_valid = numpy.ravel_multi_index(valid_positions, raster.shape)
+                        for expression in expressions:
+                            if dataset in expression and asset_band in expression:
+                                statement = expression
+                                break
 
-                                        # Match stack nodata values with observation
-                                        # stack_raster_where_nodata && raster_where_data
-                                        intersect_ravel = numpy.intersect1d(raster_todo, raster_valid)
+                        if statement is not None:
+                            context = {asset_band: input_raster}
+                            statement = statement.replace(f"{dataset}:", "")
 
-                                        if len(intersect_ravel):
-                                            where_intersec = numpy.unravel_index(intersect_ravel, raster.shape)
-                                            raster_merge[where_intersec] = raster[where_intersec]
-                                else:
-                                    valid_data_scene = raster[raster != nodata]
-                                    raster_merge[raster != nodata] = valid_data_scene.reshape(numpy.size(valid_data_scene))
-                            else:
-                                factor = raster * raster_mask
-                                raster_merge = raster_merge + factor
+                            res = execute_expression(f'_res = {statement}', context=context)
 
-                                if build_provenance:
-                                    where_valid = numpy.where(factor > 0)
-                                    raster_provenance[where_valid] = datasets.index(dataset) * factor[where_valid].astype(numpy.bool_)
-                                    where_valid = None
+                            input_raster = res['_res']
 
-                                raster_mask[raster != nodata] = 0
+                            context = None
+                            res = None
 
-                            if template is None:
-                                template = dst.profile
-                                # Ensure type is >= int16
+                    if not shape:
+                        reproject(
+                            source=input_raster,
+                            destination=raster,
+                            src_transform=src.transform,
+                            src_crs=src.crs,
+                            dst_transform=transform,
+                            dst_crs=srs,
+                            src_nodata=source_nodata,
+                            dst_nodata=nodata,
+                            resampling=resampling)
 
-                                if band != band_map['quality']:
-                                    template['dtype'] = 'int16'
-                                    template['nodata'] = nodata
+                    if band != band_map['quality'] or is_sentinel_landsat_quality_fmask:
+                        # For combined collections, we must merge only valid data into final data set
+                        if is_combined_collection:
+                            if blocks is None:
+                                blocks = list(src.block_windows(1))
+
+                            for xy, block in blocks:
+                                y_offset = block.row_off + block.height
+                                x_offset = block.col_off + block.width
+
+                                raster_block = numpy.ma.array(raster[block.row_off: y_offset, block.col_off: x_offset])
+                                merge_block = raster_merge[block.row_off: y_offset, block.col_off: x_offset]
+
+                                positions_todo = numpy.where(merge_block == nodata)
+
+                                if positions_todo:
+                                    valid_positions = numpy.where(raster_block != nodata)
+
+                                    raster_todo = numpy.ravel_multi_index(positions_todo, raster_block.shape)
+                                    raster_valid = numpy.ravel_multi_index(valid_positions, raster_block.shape)
+
+                                    # Match stack nodata values with observation
+                                    # stack_raster_where_nodata && raster_where_data
+                                    intersect_ravel = numpy.intersect1d(raster_todo, raster_valid)
+
+                                    if len(intersect_ravel):
+                                        where_intersec = numpy.unravel_index(intersect_ravel, raster_block.shape)
+                                        raster_merge[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = raster_block[where_intersec]
+
+                                        if band == band_map['quality'] and build_provenance:
+                                            factor = raster_block[where_intersec].astype(numpy.bool_)
+                                            raster_provenance[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = datasets.index(dataset) * factor
+
+                                    raster_todo = None
+                                    raster_valid = None
+                                    valid_positions = None
+                                    intersect_ravel = None
+                                    positions_todo = None
+                        else:
+                            valid_data_scene = raster[raster != nodata]
+                            raster_merge[raster != nodata] = valid_data_scene.reshape(numpy.size(valid_data_scene))
+                    else:
+                        factor = raster * raster_mask
+                        raster_merge = raster_merge + factor
+
+                        if build_provenance:
+                            where_valid = numpy.where(factor > 0)
+                            raster_provenance[where_valid] = datasets.index(dataset) * factor[where_valid].astype(numpy.bool_)
+                            where_valid = None
+
+                        raster_mask[raster != nodata] = 0
+
+                    if template is None:
+                        template = deepcopy(meta)
+                        # Ensure type is >= int16
+
+                        if band != band_map['quality']:
+                            template['dtype'] = 'int16'
+                            template['nodata'] = nodata
 
     # Evaluate cloud cover and efficacy if band is quality
     efficacy = 0
@@ -672,8 +716,10 @@ def blend(activity, band_map, build_clear_observation=False):
     if build_clear_observation:
         logging.warning('Creating and computing Clear Observation (ClearOb) file...')
 
-        clear_ob_file_path = build_cube_path(datacube, period, tile_id, version=version, band=CLEAR_OBSERVATION_NAME, suffix='.tif')
-        dataset_file_path = build_cube_path(datacube, period, tile_id, version=version, band=DATASOURCE_NAME, suffix='.tif')
+        clear_ob_file_path = build_cube_path(datacube, period, tile_id, version=version, band=CLEAR_OBSERVATION_NAME,
+                                             suffix='.tif')
+        dataset_file_path = build_cube_path(datacube, period, tile_id, version=version, band=DATASOURCE_NAME,
+                                            suffix='.tif')
 
         clear_ob_profile = profile.copy()
         clear_ob_profile['dtype'] = CLEAR_OBSERVATION_ATTRIBUTES['data_type']
@@ -690,8 +736,8 @@ def blend(activity, band_map, build_clear_observation=False):
 
             datasource = SmartDataSet(str(dataset_file_path), 'w', tags=tags, **dataset_profile)
             datasource.dataset.write(numpy.full((height, width),
-                                              fill_value=DATASOURCE_ATTRIBUTES['nodata'],
-                                              dtype=DATASOURCE_ATTRIBUTES['data_type']), indexes=1)
+                                                fill_value=DATASOURCE_ATTRIBUTES['nodata'],
+                                                dtype=DATASOURCE_ATTRIBUTES['data_type']), indexes=1)
 
     provenance_array = numpy.full((height, width), dtype=numpy.int16, fill_value=-1)
 
@@ -737,7 +783,8 @@ def blend(activity, band_map, build_clear_observation=False):
             copy_mask[copy_mask <= 4] = 1
             copy_mask[copy_mask >= 5] = 0
 
-            stack_total_observation[window.row_off: row_offset, window.col_off: col_offset] += copy_mask.astype(numpy.uint8)
+            stack_total_observation[window.row_off: row_offset, window.col_off: col_offset] += copy_mask.astype(
+                numpy.uint8)
 
             # Get current observation file name
             file_name = Path(bandlist[order].name).stem
@@ -767,7 +814,8 @@ def blend(activity, band_map, build_clear_observation=False):
 
             if len(intersect_ravel):
                 where_intersec = numpy.unravel_index(intersect_ravel, raster.shape)
-                stack_raster[window.row_off: row_offset, window.col_off: col_offset][where_intersec] = raster[where_intersec]
+                stack_raster[window.row_off: row_offset, window.col_off: col_offset][where_intersec] = raster[
+                    where_intersec]
 
                 provenance_array[window.row_off: row_offset, window.col_off: col_offset][where_intersec] = day_of_year
 
@@ -829,7 +877,8 @@ def blend(activity, band_map, build_clear_observation=False):
         clear_ob_data_set.close()
         logging.warning('Clear Observation (ClearOb) file generated successfully.')
 
-        total_observation_file = build_cube_path(datacube, period, tile_id, version=version, band=TOTAL_OBSERVATION_NAME)
+        total_observation_file = build_cube_path(datacube, period, tile_id, version=version,
+                                                 band=TOTAL_OBSERVATION_NAME)
         total_observation_profile = profile.copy()
         total_observation_profile.pop('nodata', None)
         total_observation_profile['dtype'] = 'uint8'
@@ -908,7 +957,7 @@ def has_vegetation_index_support(scene_bands: List[str], band_map: dict):
     evi_in_band_map = 'evi' in band_map or 'EVI' in band_map
 
     return (ndvi_in_band_map and evi_in_band_map) \
-        and VEGETATION_INDEX_BANDS <= set(common_name_bands)
+           and VEGETATION_INDEX_BANDS <= set(common_name_bands)
 
 
 def publish_datacube(cube, bands, tile_id, period, scenes, cloudratio, band_map, **kwargs):
@@ -1002,7 +1051,7 @@ def publish_datacube(cube, bands, tile_id, period, scenes, cloudratio, band_map,
                     absolute_path=str(scenes[band][composite_function]),
                     is_raster=True
                 )
-        
+
             item.assets = assets
             item.srid = SRID_ALBERS_EQUAL_AREA
             if min_convex_hull.area > 0.0:
@@ -1114,8 +1163,8 @@ def generate_quick_look(file_path, qlfiles):
         profile = src.profile
 
     numlin = 768
-    numcol = int(float(profile['width'])/float(profile['height'])*numlin)
-    image = numpy.ones((numlin,numcol,len(qlfiles),), dtype=numpy.uint8)
+    numcol = int(float(profile['width']) / float(profile['height']) * numlin)
+    image = numpy.ones((numlin, numcol, len(qlfiles),), dtype=numpy.uint8)
     pngname = '{}.png'.format(file_path)
 
     nb = 0
@@ -1126,7 +1175,7 @@ def generate_quick_look(file_path, qlfiles):
             # Rescale to 0-255 values
             nodata = raster <= 0
             if raster.min() != 0 or raster.max() != 0:
-                raster = raster.astype(numpy.float32)/10000.*255.
+                raster = raster.astype(numpy.float32) / 10000. * 255.
                 raster[raster > 255] = 255
             image[:, :, nb] = raster.astype(numpy.uint8) * numpy.invert(nodata)
             nb += 1
@@ -1175,7 +1224,7 @@ def getMask(raster, dataset):
         # 2 		Snow/Ice 		Target covered with snow/ice
         # 3 		Cloudy 			Target not visible, covered with cloud
         lut = numpy.array([255, 0, 0, 2, 4], dtype=numpy.uint8)
-        rastercm = numpy.take(lut, raster+1).astype(numpy.uint8)
+        rastercm = numpy.take(lut, raster + 1).astype(numpy.uint8)
     elif any('CBERS4' in elm for elm in dataset):
         # Key Summary        QA Description
         #   0 Fill/No Data - Not Processed
@@ -1201,16 +1250,17 @@ def _qa_statistics(raster) -> Tuple[float, float]:
     totpix = raster.size
     clearpix = numpy.count_nonzero(raster < 2)
     cloudpix = numpy.count_nonzero(raster > 1)
-    imagearea = clearpix+cloudpix
+    imagearea = clearpix + cloudpix
     cloudratio = 100
     if imagearea != 0:
-        cloudratio = round(100.*cloudpix/imagearea, 1)
-    efficacy = round(100.*clearpix/totpix, 2)
+        cloudratio = round(100. * cloudpix / imagearea, 1)
+    efficacy = round(100. * clearpix / totpix, 2)
 
     return efficacy, cloudratio
 
 
-def generate_evi_ndvi(red_band_path: str, nir_band_path: str, blue_bland_path: str, evi_name_path: str, ndvi_name_path: str):
+def generate_evi_ndvi(red_band_path: str, nir_band_path: str, blue_bland_path: str, evi_name_path: str,
+                      ndvi_name_path: str):
     """Generate Normalized Difference Vegetation Index (NDVI) and Enhanced Vegetation Index (EVI).
 
     Args:
@@ -1220,7 +1270,7 @@ def generate_evi_ndvi(red_band_path: str, nir_band_path: str, blue_bland_path: s
         evi_name_path: Path to save EVI file
         ndvi_name_path: Path to save NDVI file
     """
-    with rasterio.open(nir_band_path) as ds_nir, rasterio.open(red_band_path) as ds_red,\
+    with rasterio.open(nir_band_path) as ds_nir, rasterio.open(red_band_path) as ds_red, \
             rasterio.open(blue_bland_path) as ds_blue:
         profile = ds_nir.profile
         nodata = int(profile['nodata'])
@@ -1253,7 +1303,8 @@ def generate_evi_ndvi(red_band_path: str, nir_band_path: str, blue_bland_path: s
         save_as_cog(evi_name_path, raster_evi, **profile)
 
 
-def build_cube_path(datacube: str, period: str, tile_id: str, version: int, band: str = None, suffix: Union[str, None] = '.tif') -> Path:
+def build_cube_path(datacube: str, period: str, tile_id: str, version: int, band: str = None,
+                    suffix: Union[str, None] = '.tif') -> Path:
     """Retrieve the path to the Data cube file in Brazil Data Cube Cluster."""
     folder = 'Warped'
     date = period
@@ -1436,7 +1487,7 @@ def raster_convexhull(imagepath: str, epsg='EPSG:4326') -> dict:
         return multi_polygons.convex_hull
 
 
-def raster_extent(imagepath: str, epsg = 'EPSG:4326') -> shapely.geometry.Polygon:
+def raster_extent(imagepath: str, epsg='EPSG:4326') -> shapely.geometry.Polygon:
     """Get raster extent in arbitrary CRS
 
     Args:

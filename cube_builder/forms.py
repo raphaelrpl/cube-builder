@@ -135,6 +135,8 @@ class DataCubeProcessForm(Schema):
     shape = fields.List(fields.Integer(required=False))
     # Reuse data cube from another data cube
     reuse_from = fields.String(required=False, allow_none=True)
+    band_map = fields.Dict(required=False, allow_none=True)
+    expressions = fields.List(fields.String, required=False, allow_none=True)
 
 
 class PeriodForm(Schema):
