@@ -356,18 +356,19 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
                                 x_offset = block.col_off + block.width
 
                                 raster_block = numpy.ma.array(raster[block.row_off: y_offset, block.col_off: x_offset])
+                                raster_block[raster_block == nodata] = numpy.ma.masked
+
                                 merge_block = raster_merge[block.row_off: y_offset, block.col_off: x_offset]
 
                                 positions_todo = numpy.where(merge_block == nodata)
 
                                 if positions_todo:
-                                    valid_positions = numpy.where(raster_block != nodata)
+                                    valid_positions = numpy.where(raster_block != numpy.ma.masked)
 
                                     raster_todo = numpy.ravel_multi_index(positions_todo, raster_block.shape)
                                     raster_valid = numpy.ravel_multi_index(valid_positions, raster_block.shape)
 
                                     # Match stack nodata values with observation
-                                    # stack_raster_where_nodata && raster_where_data
                                     intersect_ravel = numpy.intersect1d(raster_todo, raster_valid)
 
                                     if len(intersect_ravel):
@@ -375,7 +376,8 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
                                         raster_merge[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = raster_block[where_intersec]
 
                                         if band == band_map['quality'] and build_provenance:
-                                            factor = raster_block[where_intersec].astype(numpy.bool_)
+                                            factor = numpy.invert(raster_block[where_intersec].mask)
+
                                             raster_provenance[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = datasets.index(dataset) * factor
 
                                     raster_todo = None
