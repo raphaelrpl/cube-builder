@@ -147,8 +147,9 @@ def build(datacube: str, collections: str, tiles: str, start: str, end: str, ban
         res = execute_expression(f'_res = {kwargs["band_map"]}', context=dict())
         data['band_map'] = res['_res']
 
-    if kwargs.get('expression'):
-        data['expressions'] = data.pop('expression')
+    expression = data.pop('expression')
+    if expression:
+        data['expressions'] = expression
 
     if shape is not None:
         shape = shape.split('x')
