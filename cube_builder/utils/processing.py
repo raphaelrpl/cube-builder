@@ -259,7 +259,6 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
 
         raster = numpy.zeros((rows, cols,), dtype=numpy.uint16)
         raster_merge = numpy.full((rows, cols,), dtype=numpy.uint16, fill_value=source_nodata)
-        raster_mask = numpy.ones((rows, cols,), dtype=numpy.uint16)
 
         if build_provenance:
             raster_provenance = numpy.full((rows, cols,),
@@ -330,8 +329,7 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
 
                             input_raster = res['_res']
 
-                            context = None
-                            res = None
+                            context = res = None
 
                     if not shape:
                         reproject(
@@ -345,59 +343,54 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
                             dst_nodata=nodata,
                             resampling=resampling)
 
-                    if band != band_map['quality'] or is_sentinel_landsat_quality_fmask:
-                        # For combined collections, we must merge only valid data into final data set
-                        if is_combined_collection:
-                            if blocks is None:
-                                blocks = list(src.block_windows(1))
+                    # We will merge raster data using rasterio.windows.Window blocks
+                    if blocks is None:
+                        meta['tiled'] = True
+                        block_x, block_y = src.block_shapes[0]
 
-                            for xy, block in blocks:
-                                y_offset = block.row_off + block.height
-                                x_offset = block.col_off + block.width
+                        meta['blockxsize'] = block_x
+                        meta['blockysize'] = block_y
+                        with MemoryFile() as mem_file:
+                            with mem_file.open(**meta) as mem_ds:
+                                blocks = list(mem_ds.block_windows(1))
 
-                                raster_block = numpy.ma.array(raster[block.row_off: y_offset, block.col_off: x_offset])
-                                raster_block[raster_block == nodata] = numpy.ma.masked
+                    for xy, block in blocks:
+                        y_offset = block.row_off + block.height
+                        x_offset = block.col_off + block.width
 
-                                merge_block = raster_merge[block.row_off: y_offset, block.col_off: x_offset]
+                        # Create masked array of the re-sampled data
+                        raster_block = numpy.ma.array(raster[block.row_off: y_offset, block.col_off: x_offset])
+                        raster_block[raster_block == nodata] = numpy.ma.masked
+                        # Target block to manipulate
+                        merge_block = raster_merge[block.row_off: y_offset, block.col_off: x_offset]
+                        # Look for available positions to change (nodata)
+                        positions_todo = numpy.where(merge_block == nodata)
 
-                                positions_todo = numpy.where(merge_block == nodata)
+                        if positions_todo:
+                            # Look for valid data in the reprojected raster
+                            valid_positions = numpy.where(raster_block != numpy.ma.masked)
 
-                                if positions_todo:
-                                    valid_positions = numpy.where(raster_block != numpy.ma.masked)
+                            raster_todo = numpy.ravel_multi_index(positions_todo, raster_block.shape)
+                            raster_valid = numpy.ravel_multi_index(valid_positions, raster_block.shape)
 
-                                    raster_todo = numpy.ravel_multi_index(positions_todo, raster_block.shape)
-                                    raster_valid = numpy.ravel_multi_index(valid_positions, raster_block.shape)
+                            # Match stack nodata values with observation
+                            intersect_ravel = numpy.intersect1d(raster_todo, raster_valid)
 
-                                    # Match stack nodata values with observation
-                                    intersect_ravel = numpy.intersect1d(raster_todo, raster_valid)
+                            if len(intersect_ravel):
+                                where_intersec = numpy.unravel_index(intersect_ravel, raster_block.shape)
+                                raster_merge[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = raster_block[where_intersec]
+                                # For combined collections, we must create datasource band which tracks the
+                                # pixel provenance
+                                if band == band_map['quality'] and build_provenance and is_combined_collection:
+                                    factor = numpy.invert(raster_block[where_intersec].mask)
 
-                                    if len(intersect_ravel):
-                                        where_intersec = numpy.unravel_index(intersect_ravel, raster_block.shape)
-                                        raster_merge[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = raster_block[where_intersec]
+                                    raster_provenance[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = datasets.index(dataset) * factor
 
-                                        if band == band_map['quality'] and build_provenance:
-                                            factor = numpy.invert(raster_block[where_intersec].mask)
-
-                                            raster_provenance[block.row_off: y_offset, block.col_off: x_offset][where_intersec] = datasets.index(dataset) * factor
-
-                                    raster_todo = None
-                                    raster_valid = None
-                                    valid_positions = None
-                                    intersect_ravel = None
-                                    positions_todo = None
-                        else:
-                            valid_data_scene = raster[raster != nodata]
-                            raster_merge[raster != nodata] = valid_data_scene.reshape(numpy.size(valid_data_scene))
-                    else:
-                        factor = raster * raster_mask
-                        raster_merge = raster_merge + factor
-
-                        if build_provenance:
-                            where_valid = numpy.where(factor > 0)
-                            raster_provenance[where_valid] = datasets.index(dataset) * factor[where_valid].astype(numpy.bool_)
-                            where_valid = None
-
-                        raster_mask[raster != nodata] = 0
+                            raster_todo = None
+                            raster_valid = None
+                            valid_positions = None
+                            intersect_ravel = None
+                            positions_todo = None
 
                     if template is None:
                         template = deepcopy(meta)
@@ -410,7 +403,7 @@ def merge(merge_file: str, assets: List[dict], band: str, band_map, build_proven
     # Evaluate cloud cover and efficacy if band is quality
     efficacy = 0
     cloudratio = 100
-    raster = None
+    raster = input_raster = None
     if band == band_map['quality']:
         raster_merge, efficacy, cloudratio = getMask(raster_merge, datasets)
         template.update({'dtype': 'uint8'})

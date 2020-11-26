@@ -195,17 +195,24 @@ class Maestro:
 
             keys = set(list(self.band_map.keys()) + [b.name for b in self.bands])
 
+            collections_size = len(self.params['collections'])
+
             for index, dataset in enumerate(self.params['collections']):
                 new_band_map[dataset] = {k: k for k in keys}
 
-                if index == 0:
-                    continue
-
                 for band_ref, bands_order in self.band_map.items():
-                    for band in bands_order:
-                        new_band_map.setdefault(dataset, dict())
-                        new_band_map[dataset][band_ref] = band
-                        break
+                    band = bands_order[index]
+
+                    if len(bands_order) != collections_size:
+                        raise RuntimeError(
+                            f'You have passed {collections_size} collections {self.params["collections"]}, '
+                            f'but band map for band {band_ref} is {len(bands_order)}. '
+                            f'Expected same size. Got {bands_order}'
+                        )
+
+                    new_band_map.setdefault(dataset, dict())
+                    new_band_map[dataset][band_ref] = band
+
             self.band_map = new_band_map
 
         for tile in self.tiles:
